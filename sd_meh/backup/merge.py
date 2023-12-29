@@ -15,15 +15,11 @@ from sd_meh import merge_methods
 from sd_meh.model import SDModel
 from sd_meh.rebasin import (
     apply_permutation,
-    #sdunet_permutation_spec
-    #sdxl_permutation_spec,
+    sdunet_permutation_spec,
     step_weights_and_bases,
     update_model_a,
     weight_matching,
 )
-from sd_meh.merge_PermSpec import sdunet_permutation_spec
-from sd_meh.merge_PermSpec_SDXL import sdxl_permutation_spec
-
 
 logging.getLogger("sd_meh").addHandler(logging.NullHandler())
 MAX_TOKENS = 77
@@ -93,7 +89,7 @@ def prune_sd_model(model: Dict) -> Dict:
     for k in keys:
         if (
             not k.startswith("model.diffusion_model.")
-            #and not k.startswith("first_stage_model.")
+            and not k.startswith("first_stage_model.")
             and not k.startswith("cond_stage_model.")
         ):
             del model[k]
@@ -151,7 +147,7 @@ def merge_models(
     threads: int = 1,
 ) -> Dict:
     thetas = load_thetas(models, prune, device, precision)
-    
+
     sdxl = (
         "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight"
         in thetas["model_a"].keys()
@@ -287,11 +283,12 @@ def rebasin_merge(
     device="cpu",
     work_device=None,
     threads: int = 1,
-    sdxl: bool = True,
+    sdxl: bool = False,
 ):
-    # not sure how this does when 3 models are involved...
+    # WARNING: not sure how this does when 3 models are involved...
+
     model_a = thetas["model_a"].clone()
-    perm_spec = sdxl_permutation_spec()
+    perm_spec = sdunet_permutation_spec()
 
     logging.info("Init rebasin iterations")
     for it in range(iterations):

@@ -1,40 +1,31 @@
-import gc
-import logging
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Dict, Optional, Tuple
-
 import safetensors.torch
 import torch
-from tqdm import tqdm
-
-from sd_meh import merge_methods
-from sd_meh.model import SDModel
-from sd_meh.rebasin import (
+from tensordict import TensorDict
+import modules.memstats
+import modules.devices as devices
+from modules.shared import log, console
+from modules.sd_models import read_state_dict
+from modules.merging import merge_methods
+from modules.merging.merge_utils import WeightClass
+from modules.merging.merge_rebasin import (
     apply_permutation,
-    #sdunet_permutation_spec
-    #sdxl_permutation_spec,
-    step_weights_and_bases,
     update_model_a,
     weight_matching,
 )
-from sd_meh.merge_PermSpec import sdunet_permutation_spec
-from sd_meh.merge_PermSpec_SDXL import sdxl_permutation_spec
+from modules.merging.merge_PermSpec import sdunet_permutation_spec
+from modules.merging.merge_PermSpec_SDXL import sdxl_permutation_spec
+##########################################################
+# Files in modules.merging are heavily modified
+# versions of sd-meh by @s1dxl used with his blessing
+# orginal code can be found @ https://github.com/s1dlx/meh
+##########################################################
 
-
-logging.getLogger("sd_meh").addHandler(logging.NullHandler())
 MAX_TOKENS = 77
-NUM_INPUT_BLOCKS = 12
-NUM_MID_BLOCK = 1
-NUM_OUTPUT_BLOCKS = 12
-NUM_TOTAL_BLOCKS = NUM_INPUT_BLOCKS + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS
 
-NUM_INPUT_BLOCKS_XL = 9
-NUM_OUTPUT_BLOCKS_XL = 9
-NUM_TOTAL_BLOCKS_XL = NUM_INPUT_BLOCKS_XL + NUM_MID_BLOCK + NUM_OUTPUT_BLOCKS_XL
 
 KEY_POSITION_IDS = ".".join(
     [
@@ -45,13 +36,6 @@ KEY_POSITION_IDS = ".".join(
         "position_ids",
     ]
 )
-
-
-NAI_KEYS = {
-    "cond_stage_model.transformer.embeddings.": "cond_stage_model.transformer.text_model.embeddings.",
-    "cond_stage_model.transformer.encoder.": "cond_stage_model.transformer.text_model.encoder.",
-    "cond_stage_model.transformer.final_layer_norm.": "cond_stage_model.transformer.text_model.final_layer_norm.",
-}
 
 
 def fix_clip(model: Dict) -> Dict:
@@ -65,35 +49,12 @@ def fix_clip(model: Dict) -> Dict:
     return model
 
 
-def fix_key(model: Dict, key: str) -> Dict:
-    for nk in NAI_KEYS:
-        if key.startswith(nk):
-            model[key.replace(nk, NAI_KEYS[nk])] = model[key]
-            del model[key]
-
-    return model
-
-
-# https://github.com/j4ded/sdweb-merge-block-weighted-gui/blob/master/scripts/mbw/merge_block_weighted.py#L115
-def fix_model(model: Dict) -> Dict:
-    for k in model.keys():
-        model = fix_key(model, k)
-    return fix_clip(model)
-
-
-def load_sd_model(model: os.PathLike | str, device: str = "cpu") -> Dict:
-    if isinstance(model, str):
-        model = Path(model)
-
-    return SDModel(model, device).load_model()
-
-
 def prune_sd_model(model: Dict) -> Dict:
     keys = list(model.keys())
     for k in keys:
         if (
             not k.startswith("model.diffusion_model.")
-            #and not k.startswith("first_stage_model.")
+            # and not k.startswith("first_stage_model.")
             and not k.startswith("cond_stage_model.")
         ):
             del model[k]
@@ -108,82 +69,68 @@ def restore_sd_model(original_model: Dict, merged_model: Dict) -> Dict:
 
 
 def log_vram(txt=""):
-    alloc = torch.cuda.memory_allocated(0)
-    logging.debug(f"{txt} VRAM: {alloc*1e-9:5.3f}GB")
+    log.debug(f"Merge {txt}: {modules.memstats.memory_stats()}")
 
 
 def load_thetas(
-    models: Dict[str, os.PathLike | str],
+    models: Dict[str, os.PathLike],
     prune: bool,
-    device: str,
-    precision: int,
+    device: torch.device,
+    precision: str,
 ) -> Dict:
-    log_vram("before loading models")
     if prune:
-        thetas = {k: prune_sd_model(load_sd_model(m, "cpu")) for k, m in models.items()}
+        thetas = {k: prune_sd_model(TensorDict.from_dict(read_state_dict(m, "cpu"))) for k, m in models.items()}
     else:
-        thetas = {k: load_sd_model(m, device) for k, m in models.items()}
+        thetas = {k: TensorDict.from_dict(read_state_dict(m, device)) for k, m in models.items()}
 
-    if device == "cuda":
-        for model_key, model in thetas.items():
-            for key, block in model.items():
-                if precision == 16:
-                    thetas[model_key].update({key: block.to(device).half()})
-                else:
-                    thetas[model_key].update({key: block.to(device)})
+    for model_key, model in thetas.items():
+        for key, block in model.items():
+            if precision == "fp16":
+                thetas[model_key].update({key: block.to(device).half()})
+            else:
+                thetas[model_key].update({key: block.to(device)})
 
     log_vram("models loaded")
     return thetas
 
 
 def merge_models(
-    models: Dict[str, os.PathLike | str],
-    weights: Dict,
-    bases: Dict,
+    models: Dict[str, os.PathLike],
     merge_mode: str,
-    precision: int = 16,
+    precision: str = "fp16",
     weights_clip: bool = False,
     re_basin: bool = False,
-    iterations: int = 1,
-    device: str = "cpu",
-    work_device: Optional[str] = None,
+    device: torch.device = None,
+    work_device: torch.device = None,
     prune: bool = False,
-    threads: int = 1,
+    threads: int = 4,
+    **kwargs,
 ) -> Dict:
     thetas = load_thetas(models, prune, device, precision)
-    
-    sdxl = (
-        "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.weight"
-        in thetas["model_a"].keys()
-    )
-
-    logging.info(f"start merging with {merge_mode} method")
+    # log.info(f'Merge start: models={models.values()} precision={precision} clip={weights_clip} rebasin={re_basin} prune={prune} threads={threads}')
+    weight_matcher = WeightClass(thetas["model_a"], **kwargs)
     if re_basin:
         merged = rebasin_merge(
             thetas,
-            weights,
-            bases,
+            weight_matcher,
             merge_mode,
             precision=precision,
             weights_clip=weights_clip,
-            iterations=iterations,
+            iterations=kwargs.get("re_basin_iterations", 1),
             device=device,
             work_device=work_device,
             threads=threads,
-            sdxl=sdxl,
         )
     else:
         merged = simple_merge(
             thetas,
-            weights,
-            bases,
+            weight_matcher,
             merge_mode,
             precision=precision,
             weights_clip=weights_clip,
             device=device,
             work_device=work_device,
             threads=threads,
-            sdxl=sdxl,
         )
 
     return un_prune_model(merged, thetas, models, device, prune, precision)
@@ -193,133 +140,126 @@ def un_prune_model(
     merged: Dict,
     thetas: Dict,
     models: Dict,
-    device: str,
+    device: torch.device,
     prune: bool,
-    precision: int,
+    precision: str,
 ) -> Dict:
     if prune:
-        logging.info("Un-pruning merged model")
+        log.info("Merge restoring pruned keys")
         del thetas
-        gc.collect()
-        log_vram("remove thetas")
-        original_a = load_sd_model(models["model_a"], device)
-        for key in tqdm(original_a.keys(), desc="un-prune model a"):
+        devices.torch_gc(force=False)
+        original_a = TensorDict.from_dict(read_state_dict(models["model_a"], device))
+        unpruned = 0
+        for key in original_a.keys():
             if KEY_POSITION_IDS in key:
                 continue
             if "model" in key and key not in merged.keys():
                 merged.update({key: original_a[key]})
-                if precision == 16:
+                unpruned += 1
+                if precision == "fp16":
                     merged.update({key: merged[key].half()})
+        if unpruned > 248:  # VAE has 248 keys, and we are purposely restoring it here
+            log.debug(f"Merge restored from primary model: keys={unpruned - 248}")
+        unpruned = 0
         del original_a
-        gc.collect()
-        log_vram("remove original_a")
-        original_b = load_sd_model(models["model_b"], device)
-        for key in tqdm(original_b.keys(), desc="un-prune model b"):
+        original_b = TensorDict.from_dict(read_state_dict(models["model_b"], device))
+        for key in original_b.keys():
             if KEY_POSITION_IDS in key:
                 continue
             if "model" in key and key not in merged.keys():
                 merged.update({key: original_b[key]})
-                if precision == 16:
+                unpruned += 1
+                if precision == "fp16":
                     merged.update({key: merged[key].half()})
+        if unpruned != 0:
+            log.debug(f"Merge restored from secondary model: keys={unpruned}")
         del original_b
+        devices.torch_gc(force=False)
 
-    return fix_model(merged)
+    return fix_clip(merged)
 
 
 def simple_merge(
     thetas: Dict[str, Dict],
-    weights: Dict,
-    bases: Dict,
+    weight_matcher: WeightClass,
     merge_mode: str,
-    precision: int = 16,
+    precision: str = "fp16",
     weights_clip: bool = False,
-    device: str = "cpu",
-    work_device: Optional[str] = None,
-    threads: int = 1,
-    sdxl: bool = False,
+    device: torch.device = None,
+    work_device: torch.device = None,
+    threads: int = 4,
 ) -> Dict:
     futures = []
-    with tqdm(thetas["model_a"].keys(), desc="stage 1") as progress:
+    # with tqdm(thetas["model_a"].keys(), desc="Merge") as progress:
+    import rich.progress as p
+    with p.Progress(p.TextColumn('[cyan]{task.description}'), p.BarColumn(), p.TaskProgressColumn(), p.TimeRemainingColumn(), p.TimeElapsedColumn(), p.TextColumn('[cyan]keys={task.fields[keys]}'), console=console) as progress:
+        task = progress.add_task(description="Merging", total=len(thetas["model_a"].keys()), keys=len(thetas["model_a"].keys()))
         with ThreadPoolExecutor(max_workers=threads) as executor:
             for key in thetas["model_a"].keys():
                 future = executor.submit(
                     simple_merge_key,
                     progress,
+                    task,
                     key,
                     thetas,
-                    weights,
-                    bases,
+                    weight_matcher,
                     merge_mode,
                     precision,
                     weights_clip,
                     device,
                     work_device,
-                    sdxl,
                 )
                 futures.append(future)
 
         for res in futures:
             res.result()
 
-    log_vram("after stage 1")
+    if len(thetas["model_b"]) > 0:
+        log.debug(f'Merge update thetas: keys={len(thetas["model_b"])}')
+        for key in thetas["model_b"].keys():
+            if KEY_POSITION_IDS in key:
+                continue
+            if "model" in key and key not in thetas["model_a"].keys():
+                thetas["model_a"].update({key: thetas["model_b"][key]})
+                if precision == "fp16":
+                    thetas["model_a"].update({key: thetas["model_a"][key].half()})
 
-    for key in tqdm(thetas["model_b"].keys(), desc="stage 2"):
-        if KEY_POSITION_IDS in key:
-            continue
-        if "model" in key and key not in thetas["model_a"].keys():
-            thetas["model_a"].update({key: thetas["model_b"][key]})
-            if precision == 16:
-                thetas["model_a"].update({key: thetas["model_a"][key].half()})
-
-    log_vram("after stage 2")
-
-    return fix_model(thetas["model_a"])
+    return fix_clip(thetas["model_a"])
 
 
 def rebasin_merge(
-    thetas: Dict[str, os.PathLike | str],
-    weights: Dict,
-    bases: Dict,
+    thetas: Dict[str, os.PathLike],
+    weight_matcher: WeightClass,
     merge_mode: str,
-    precision: int = 16,
+    precision: str = "fp16",
     weights_clip: bool = False,
     iterations: int = 1,
-    device="cpu",
-    work_device=None,
+    device: torch.device = None,
+    work_device: torch.device = None,
     threads: int = 1,
-    sdxl: bool = True,
 ):
     # not sure how this does when 3 models are involved...
     model_a = thetas["model_a"].clone()
-    perm_spec = sdxl_permutation_spec()
+    if weight_matcher.SDXL:
+        perm_spec = sdxl_permutation_spec()
+    else:
+        perm_spec = sdunet_permutation_spec()
 
-    logging.info("Init rebasin iterations")
     for it in range(iterations):
-        logging.info(f"Rebasin iteration {it}")
-        log_vram(f"{it} iteration start")
-        new_weights, new_bases = step_weights_and_bases(
-            weights,
-            bases,
-            it,
-            iterations,
-        )
-        log_vram("weights & bases, before simple merge")
+        log_vram(f"rebasin: iteration={it}")
+        weight_matcher.set_it(it)
 
         # normal block merge we already know and love
         thetas["model_a"] = simple_merge(
             thetas,
-            new_weights,
-            new_bases,
+            weight_matcher,
             merge_mode,
             precision,
             False,
             device,
             work_device,
             threads,
-            sdxl,
         )
-
-        log_vram("simple merge done")
 
         # find permutations
         perm_1, y = weight_matching(
@@ -328,15 +268,10 @@ def rebasin_merge(
             thetas["model_a"],
             max_iter=it,
             init_perm=None,
-            usefp16=precision == 16,
+            usefp16=precision == "fp16",
             device=device,
         )
-
-        log_vram("weight matching #1 done")
-
         thetas["model_a"] = apply_permutation(perm_spec, perm_1, thetas["model_a"])
-
-        log_vram("apply perm 1 done")
 
         perm_2, z = weight_matching(
             perm_spec,
@@ -344,11 +279,9 @@ def rebasin_merge(
             thetas["model_a"],
             max_iter=it,
             init_perm=None,
-            usefp16=precision == 16,
+            usefp16=precision == "fp16",
             device=device,
         )
-
-        log_vram("weight matching #2 done")
 
         new_alpha = torch.nn.functional.normalize(
             torch.sigmoid(torch.Tensor([y, z])), p=1, dim=0
@@ -356,8 +289,6 @@ def rebasin_merge(
         thetas["model_a"] = update_model_a(
             perm_spec, perm_2, thetas["model_a"], new_alpha
         )
-
-        log_vram("model a updated")
 
     if weights_clip:
         clip_thetas = thetas.copy()
@@ -367,25 +298,22 @@ def rebasin_merge(
     return thetas["model_a"]
 
 
-def simple_merge_key(progress, key, thetas, *args, **kwargs):
+def simple_merge_key(progress, task, key, thetas, *args, **kwargs):
     with merge_key_context(key, thetas, *args, **kwargs) as result:
         if result is not None:
             thetas["model_a"].update({key: result.detach().clone()})
+    progress.update(task, advance=1)
 
-        progress.update()
 
-
-def merge_key(
+def merge_key(  # pylint: disable=inconsistent-return-statements
     key: str,
     thetas: Dict,
-    weights: Dict,
-    bases: Dict,
+    weight_matcher: WeightClass,
     merge_mode: str,
-    precision: int = 16,
+    precision: str = "fp16",
     weights_clip: bool = False,
-    device: str = "cpu",
-    work_device: Optional[str] = None,
-    sdxl: bool = False,
+    device: torch.device = None,
+    work_device: torch.device = None,
 ) -> Optional[Tuple[str, Dict]]:
     if work_device is None:
         work_device = device
@@ -395,41 +323,9 @@ def merge_key(
 
     for theta in thetas.values():
         if key not in theta.keys():
-            return
+            return thetas["model_a"][key]
 
-    if "model" in key:
-        current_bases = bases
-
-        if "model.diffusion_model." in key:
-            weight_index = -1
-
-            re_inp = re.compile(r"\.input_blocks\.(\d+)\.")  # 12
-            re_mid = re.compile(r"\.middle_block\.(\d+)\.")  # 1
-            re_out = re.compile(r"\.output_blocks\.(\d+)\.")  # 12
-
-            if "time_embed" in key:
-                weight_index = 0  # before input blocks
-            elif ".out." in key:
-                weight_index = (
-                    NUM_TOTAL_BLOCKS_XL - 1 if sdxl else NUM_TOTAL_BLOCKS - 1
-                )  # after output blocks
-            elif m := re_inp.search(key):
-                weight_index = int(m.groups()[0])
-            elif re_mid.search(key):
-                weight_index = NUM_INPUT_BLOCKS_XL if sdxl else NUM_INPUT_BLOCKS
-            elif m := re_out.search(key):
-                weight_index = (
-                    (NUM_INPUT_BLOCKS_XL if sdxl else NUM_INPUT_BLOCKS)
-                    + NUM_MID_BLOCK
-                    + int(m.groups()[0])
-                )
-
-            if weight_index >= (NUM_TOTAL_BLOCKS_XL if sdxl else NUM_TOTAL_BLOCKS):
-                raise ValueError(f"illegal block index {weight_index} for key {key}")
-
-            if weight_index >= 0:
-                current_bases = {k: w[weight_index] for k, w in weights.items()}
-
+        current_bases = weight_matcher(key)
         try:
             merge_method = getattr(merge_methods, merge_mode)
         except AttributeError as e:
@@ -437,7 +333,7 @@ def merge_key(
 
         merge_args = get_merge_method_args(current_bases, thetas, key, work_device)
 
-        # dealing wiht pix2pix and inpainting models
+        # dealing with pix2pix and inpainting models
         if (a_size := merge_args["a"].size()) != (b_size := merge_args["b"].size()):
             if a_size[1] > b_size[1]:
                 merged_key = merge_args["a"]
@@ -449,7 +345,7 @@ def merge_key(
         if weights_clip:
             merged_key = clip_weights_key(thetas, merged_key, key)
 
-        if precision == 16:
+        if precision == "fp16":
             merged_key = merged_key.half()
 
         return merged_key
@@ -484,7 +380,7 @@ def get_merge_method_args(
     current_bases: Dict,
     thetas: Dict,
     key: str,
-    work_device: str,
+    work_device: torch.device,
 ) -> Dict:
     merge_method_args = {
         "a": thetas["model_a"][key].to(work_device),
@@ -499,7 +395,7 @@ def get_merge_method_args(
 
 
 def save_model(model, output_file, file_format) -> None:
-    logging.info(f"Saving {output_file}")
+    log.info(f"Merge saving: model='{output_file}'")
     if file_format == "safetensors":
         safetensors.torch.save_file(
             model if type(model) == dict else model.to_dict(),

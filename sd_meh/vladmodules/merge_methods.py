@@ -1,9 +1,8 @@
-import functools
 import math
-import operator
+from typing import Tuple
+
 import torch
 from torch import Tensor
-from typing import Tuple
 
 __all__ = [
     "weighted_sum",
@@ -18,20 +17,27 @@ __all__ = [
     "similarity_add_difference",
     "distribution_crossover",
     "ties_add_difference",
-    "rotate",
 ]
 
 
 EPSILON = 1e-10  # Define a small constant EPSILON to prevent division by zero
 
 
-def weighted_sum(a: Tensor, b: Tensor, alpha: float, **kwargs) -> Tensor:
+def weighted_sum(a: Tensor, b: Tensor, alpha: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Basic Merge:
+    alpha 0 returns Primary Model
+    alpha 1 returns Secondary Model
+    """
     return (1 - alpha) * a + alpha * b
 
 
-def weighted_subtraction(
-    a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def weighted_subtraction(a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    The inverse of a Weighted Sum Merge
+    Returns Primary Model when alpha*beta = 0
+    High values of alpha*beta are likely to break the merged model
+    """
     # Adjust beta if both alpha and beta are 1.0 to avoid division by zero
     if alpha == 1.0 and beta == 1.0:
         beta -= EPSILON
@@ -39,7 +45,13 @@ def weighted_subtraction(
     return (a - alpha * beta * b) / (1 - alpha * beta)
 
 
-def tensor_sum(a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:
+def tensor_sum(a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Takes a slice of Secondary Model and pastes it into Primary Model
+    Alpha sets the width of the slice
+    Beta sets the start point of the slice
+    ie Alpha = 0.5 Beta = 0.25 is (ABBA) Alpha = 0.25 Beta = 0 is (BAAA)
+    """
     if alpha + beta <= 1:
         tt = a.clone()
         talphas = int(a.shape[0] * beta)
@@ -53,25 +65,38 @@ def tensor_sum(a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs) -> Ten
     return tt
 
 
-def add_difference(a: Tensor, b: Tensor, c: Tensor, alpha: float, **kwargs) -> Tensor:
+def add_difference(a: Tensor, b: Tensor, c: Tensor, alpha: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Classic Add Difference Merge
+    """
     return a + alpha * (b - c)
 
 
-def sum_twice(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def sum_twice(a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Stacked Basic Merge:
+    Equivalent to Merging Primary and Secondary @ alpha
+    Then merging the result with Tertiary @ beta
+    """
     return (1 - beta) * ((1 - alpha) * a + alpha * b) + beta * c
 
 
-def triple_sum(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def triple_sum(a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Weights Secondary and Tertiary at alpha and beta respectively
+    Fills in the rest with Primary
+    Expect odd results if alpha + beta > 1 as Primary will be merged with a negative ratio
+    """
     return (1 - alpha - beta) * a + alpha * b + beta * c
 
 
-def euclidean_add_difference(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, **kwargs
-) -> Tensor:
+def euclidean_add_difference(a: Tensor, b: Tensor, c: Tensor, alpha: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Subtract Primary and Secondary from Tertiary
+    Compare the remainders via Euclidean distance
+    Add to Tertiary
+    Note: Slow
+    """
     a_diff = a.float() - c.float()
     b_diff = b.float() - c.float()
     a_diff = torch.nan_to_num(a_diff / torch.linalg.norm(a_diff))
@@ -86,18 +111,20 @@ def euclidean_add_difference(
     return c + distance / torch.linalg.norm(distance) * target_norm
 
 
-def multiply_difference(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def multiply_difference(a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Similar to Add Difference but with geometric mean instead of arithmatic mean
+    """
     diff_a = torch.pow(torch.abs(a.float() - c), (1 - alpha))
     diff_b = torch.pow(torch.abs(b.float() - c), alpha)
     difference = torch.copysign(diff_a * diff_b, weighted_sum(a, b, beta) - c)
     return c + difference.to(c.dtype)
 
 
-def top_k_tensor_sum(
-    a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def top_k_tensor_sum(a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Redistributes the largest weights of Secondary Model into Primary Model
+    """
     a_flat = torch.flatten(a)
     a_dist = torch.msort(a_flat)
     b_indices = torch.argsort(torch.flatten(b), stable=True)
@@ -146,9 +173,10 @@ def ratio_to_region(width: float, offset: float, n: int) -> Tuple[int, int, bool
     return round(start), round(end), inverted
 
 
-def similarity_add_difference(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def similarity_add_difference(a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    Weighted Sum where A and B are similar and Add Difference where A and B are dissimilar
+    """
     threshold = torch.maximum(torch.abs(a), torch.abs(b))
     similarity = ((a * b / threshold**2) + 1) / 2
     similarity = torch.nan_to_num(similarity * beta, nan=beta)
@@ -158,9 +186,14 @@ def similarity_add_difference(
     return (1 - similarity) * ab_diff + similarity * ab_sum
 
 
-def distribution_crossover(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs
-):
+def distribution_crossover(a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs):  # pylint: disable=unused-argument
+    """
+    From the creator:
+    It's Primary high-passed + Secondary low-passed. Takes the fourrier transform of the weights of
+    Primary and Secondary when ordered with respect to Tertiary. Split the frequency domain
+    using a linear function. Alpha is the split frequency and Beta is the inclination of the line.
+    add everything under the line as the contribution of Primary and everything over the line as the contribution of Secondary
+    """
     if a.shape == ():
         return alpha * a + (1 - alpha) * b
 
@@ -185,9 +218,10 @@ def distribution_crossover(
     return x_values.reshape_as(a)
 
 
-def ties_add_difference(
-    a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs
-) -> Tensor:
+def ties_add_difference(a: Tensor, b: Tensor, c: Tensor, alpha: float, beta: float, **kwargs) -> Tensor:  # pylint: disable=unused-argument
+    """
+    An implementation of arXiv:2306.01708
+    """
     deltas = []
     signs = []
     for m in [a, b]:
@@ -211,75 +245,3 @@ def filter_top_k(a: Tensor, k: float):
     k_value, _ = torch.kthvalue(torch.abs(a.flatten()).float(), k)
     top_k_filter = (torch.abs(a) >= k_value).float()
     return a * top_k_filter
-
-
-def rotate(a: Tensor, b: Tensor, alpha: float, beta: float, **kwargs):
-    if alpha == 0 and beta == 0:
-        return a
-
-    is_conv = len(a.shape) == 4 and a.shape[-1] != 1
-    if len(a.shape) == 0 or is_conv or torch.allclose(a.half(), b.half()):
-        return weighted_sum(a, b, beta)
-
-    if len(a.shape) == 4:
-        shape_2d = (-1, functools.reduce(operator.mul, a.shape[1:]))
-    else:
-        shape_2d = (-1, a.shape[-1])
-
-    a_neurons = a.reshape(*shape_2d).double()
-    b_neurons = b.reshape(*shape_2d).double()
-
-    a_centroid = a_neurons.mean(0)
-    b_centroid = b_neurons.mean(0)
-    new_centroid = weighted_sum(a_centroid, b_centroid, alpha)
-    if len(a.shape) == 1 or len(a.shape) == 2 and a.shape[0] == 1:
-        return new_centroid.reshape_as(a)
-
-    a_neurons -= a_centroid
-    b_neurons -= b_centroid
-
-    svd_driver = "gesvd" if a.is_cuda else None
-    u, _, v_t = torch.linalg.svd(a_neurons.T @ b_neurons, driver=svd_driver)
-
-    alpha_is_float = alpha != round(alpha)
-    if alpha_is_float:
-        # cancel reflection. without this, eigenvalues often have a complex component
-        #   and then we can't obtain a valid dtype for the merge
-        u[:, -1] /= torch.det(u) * torch.det(v_t)
-
-    transform = rotation = u @ v_t
-    if not torch.isfinite(u).all():
-        raise ValueError(
-            textwrap.dedent(
-                f"""determinant error: {torch.det(rotation)}.
-            This can happen when merging on the CPU with the "rotate" method.
-            Consider merging on a cuda device, or try setting alpha to 1 for the problematic blocks.
-            See this related discussion for more info: https://github.com/s1dlx/meh/pull/50#discussion_r1429469484"""
-            )
-        )
-
-    if alpha_is_float:
-        transform = fractional_matrix_power(transform, alpha)
-    elif alpha == 0:
-        transform = torch.eye(
-            len(transform),
-            dtype=transform.dtype,
-            device=transform.device,
-        )
-    elif alpha != 1:
-        transform = torch.linalg.matrix_power(transform, round(alpha))
-
-    if beta != 0:
-        # interpolate the relationship between the neurons
-        a_neurons = weighted_sum(a_neurons, b_neurons @ rotation.T, beta)
-
-    a_neurons @= transform
-    a_neurons += new_centroid
-    return a_neurons.reshape_as(a).to(a.dtype)
-
-
-def fractional_matrix_power(matrix: Tensor, power: float):
-    eigenvalues, eigenvectors = torch.linalg.eig(matrix)
-    eigenvalues.pow_(power)
-    result = eigenvectors @ torch.diag(eigenvalues) @ torch.linalg.inv(eigenvectors)
-    return result.real.to(dtype=matrix.dtype)

@@ -94,6 +94,66 @@ def update_model_a(ps: PermutationSpec, perm, model_a, new_alpha):
     return model_a
 
 
+def inner_matching(
+    n,
+    ps,
+    p,
+    params_a,
+    params_b,
+    usefp16,
+    progress,
+    number,
+    linear_sum,
+    perm,
+    device,
+):
+    A = torch.zeros((n, n), dtype=torch.float16) if usefp16 else torch.zeros((n, n))
+    A = A.to(device)
+
+    for wk, axis in ps.perm_to_axes[p]:
+        w_a = params_a[wk]
+        w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
+        w_a = torch.moveaxis(w_a, axis, 0).reshape((n, -1)).to(device)
+        w_b = torch.moveaxis(w_b, axis, 0).reshape((n, -1)).T.to(device)
+
+        if usefp16:
+            w_a = w_a.half().to(device)
+            w_b = w_b.half().to(device)
+
+        try:
+            A += torch.matmul(w_a, w_b)
+        except RuntimeError:
+            A += torch.matmul(torch.dequantize(w_a), torch.dequantize(w_b))
+
+    A = A.cpu()
+    ri, ci = linear_sum_assignment(A.detach().numpy(), maximize=True)
+    A = A.to(device)
+
+    assert (torch.tensor(ri) == torch.arange(len(ri))).all()
+
+    eye_tensor = torch.eye(n).to(device)
+
+    oldL = torch.vdot(
+        torch.flatten(A).float(), torch.flatten(eye_tensor[perm[p].long()])
+    )
+    newL = torch.vdot(torch.flatten(A).float(), torch.flatten(eye_tensor[ci, :]))
+
+    if usefp16:
+        oldL = oldL.half()
+        newL = newL.half()
+
+    if newL - oldL != 0:
+        linear_sum += abs((newL - oldL).item())
+        number += 1
+        log.debug(f"Merge Rebasin permutation: {p}={newL-oldL}")
+
+    progress = progress or newL > oldL + 1e-12
+
+    perm[p] = torch.Tensor(ci).to(device)
+
+    return linear_sum, number, perm, progress
+
+
 def weight_matching(
     ps: PermutationSpec,
     params_a,

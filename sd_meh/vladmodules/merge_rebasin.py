@@ -1,13 +1,12 @@
 # https://github.com/ogkalu2/Merge-Stable-Diffusion-models-without-distortion
-import logging
 from collections import defaultdict
 from random import shuffle
-from typing import Dict, NamedTuple, Tuple
-
+from typing import NamedTuple
 import torch
 from scipy.optimize import linear_sum_assignment
+from modules.shared import log
 
-logging.getLogger("sd_meh").addHandler(logging.NullHandler())
+
 SPECIAL_KEYS = [
     "first_stage_model.decoder.norm_out.weight",
     "first_stage_model.decoder.norm_out.bias",
@@ -16,36 +15,6 @@ SPECIAL_KEYS = [
     "model.diffusion_model.out.0.weight",
     "model.diffusion_model.out.0.bias",
 ]
-
-
-def step_weights_and_bases(
-    weights: Dict, bases: Dict, it: int = 0, iterations: int = 1
-) -> Tuple[Dict, Dict]:
-    new_weights = {
-        gl: [
-            1 - (1 - (1 + it) * v / iterations) / (1 - it * v / iterations)
-            if it > 0
-            else v / iterations
-            for v in w
-        ]
-        for gl, w in weights.items()
-    }
-
-    new_bases = {
-        k: 1 - (1 - (1 + it) * v / iterations) / (1 - it * v / iterations)
-        if it > 0
-        else v / iterations
-        for k, v in bases.items()
-    }
-
-    return new_weights, new_bases
-
-
-def flatten_params(model):
-    return model["state_dict"]
-
-
-rngmix = lambda rng, x: random.fold_in(rng, hash(x))
 
 
 class PermutationSpec(NamedTuple):
@@ -94,6 +63,66 @@ def update_model_a(ps: PermutationSpec, perm, model_a, new_alpha):
     return model_a
 
 
+def inner_matching(
+    n,
+    ps,
+    p,
+    params_a,
+    params_b,
+    usefp16,
+    progress,
+    number,
+    linear_sum,
+    perm,
+    device,
+):
+    A = torch.zeros((n, n), dtype=torch.float16) if usefp16 else torch.zeros((n, n))
+    A = A.to(device)
+
+    for wk, axis in ps.perm_to_axes[p]:
+        w_a = params_a[wk]
+        w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
+        w_a = torch.moveaxis(w_a, axis, 0).reshape((n, -1)).to(device)
+        w_b = torch.moveaxis(w_b, axis, 0).reshape((n, -1)).T.to(device)
+
+        if usefp16:
+            w_a = w_a.half().to(device)
+            w_b = w_b.half().to(device)
+
+        try:
+            A += torch.matmul(w_a, w_b)
+        except RuntimeError:
+            A += torch.matmul(torch.dequantize(w_a), torch.dequantize(w_b))
+
+    A = A.cpu()
+    ri, ci = linear_sum_assignment(A.detach().numpy(), maximize=True)
+    A = A.to(device)
+
+    assert (torch.tensor(ri) == torch.arange(len(ri))).all()
+
+    eye_tensor = torch.eye(n).to(device)
+
+    oldL = torch.vdot(
+        torch.flatten(A).float(), torch.flatten(eye_tensor[perm[p].long()])
+    )
+    newL = torch.vdot(torch.flatten(A).float(), torch.flatten(eye_tensor[ci, :]))
+
+    if usefp16:
+        oldL = oldL.half()
+        newL = newL.half()
+
+    if newL - oldL != 0:
+        linear_sum += abs((newL - oldL).item())
+        number += 1
+        log.debug(f"Merge Rebasin permutation: {p}={newL-oldL}")
+
+    progress = progress or newL > oldL + 1e-12
+
+    perm[p] = torch.Tensor(ci).to(device)
+
+    return linear_sum, number, perm, progress
+
+
 def weight_matching(
     ps: PermutationSpec,
     params_a,
@@ -118,13 +147,12 @@ def weight_matching(
     linear_sum = 0
     number = 0
 
-    special_layers = ["P_bg324", "P_bg358", "P_bg337"]
-    for _ in range(max_iter):
+    special_layers = ["P_bg324"]
+    for _i in range(max_iter):
         progress = False
         shuffle(special_layers)
         for p in special_layers:
             n = perm_sizes[p]
-
             linear_sum, number, perm, progress = inner_matching(
                 n,
                 ps,
@@ -138,12 +166,12 @@ def weight_matching(
                 perm,
                 device,
             )
+        progress = True
         if not progress:
             break
 
     average = linear_sum / number if number > 0 else 0
-    return (perm, average)
-
+    return perm, average
 
 def inner_matching(
     n,
